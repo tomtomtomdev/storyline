@@ -12,11 +12,13 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query private var audiobooks: [Audiobook]
     @State private var selectedTab = 0
+    @State private var playbackManager: PlaybackManager?
+    @State private var playerViewModel: PlayerViewModel?
 
     var body: some View {
         TabView(selection: $selectedTab) {
             // Library Tab
-            LibraryView()
+            LibraryView(playbackManager: playbackManager)
                 .tabItem {
                     Label("Library", systemImage: "books.vertical")
                 }
@@ -37,6 +39,73 @@ struct ContentView: View {
                 .tag(2)
         }
         .tint(Color.themePrimary)
+        .onAppear {
+            Task {
+                // Initialize playback manager
+                if playbackManager == nil {
+                    playbackManager = PlaybackManager()
+                    playerViewModel = PlayerViewModel(
+                        playbackManager: playbackManager!,
+                        modelContext: modelContext
+                    )
+
+                    // Create sample audiobooks if library is empty
+                    if audiobooks.isEmpty {
+                        await createSampleAudiobooks()
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Private Methods
+
+    /// Creates sample audiobooks for testing
+    private func createSampleAudiobooks() async {
+        // Create sample audio file
+        guard let audioURL = AudioFileManager.createSampleAudioFile() else {
+            print("Failed to create sample audio file")
+            return
+        }
+
+        // Create sample audiobooks
+        let sampleBooks = [
+            Audiobook(
+                title: "The Art of Swift Development",
+                author: "Apple Education Team",
+                narrator: "Professional Narrator",
+                duration: 30, // 30 seconds for sample
+                audioFileURL: audioURL,
+                tags: ["Education", "Programming", "Favorites"]
+            ),
+            Audiobook(
+                title: "Mystery at Midnight",
+                author: "Jane Doe",
+                narrator: "John Smith",
+                duration: 30,
+                audioFileURL: audioURL,
+                tags: ["Fiction", "Mystery"]
+            ),
+            Audiobook(
+                title: "History of Technology",
+                author: "Dr. Robert Johnson",
+                narrator: "Emma Wilson",
+                duration: 30,
+                audioFileURL: audioURL,
+                tags: ["Non-fiction", "History", "Technology"]
+            )
+        ]
+
+        // Insert into SwiftData
+        for book in sampleBooks {
+            modelContext.insert(book)
+        }
+
+        do {
+            try modelContext.save()
+        } catch {
+            print("Failed to save sample audiobooks: \(error)")
+        }
     }
 }
 
@@ -48,10 +117,40 @@ struct LibraryView: View {
     @State private var searchText = ""
     @State private var viewLayout: ViewLayoutOption = .grid
     @State private var sortOrder: SortOption = .dateAdded
+    @State private var selectedAudiobook: Audiobook?
+    @State private var showingPlayer = false
+
+    let playbackManager: PlaybackManager?
 
     var filteredAudiobooks: [Audiobook] {
-        // TODO: Implement filtering and sorting
-        audiobooks
+        var filtered = audiobooks
+
+        // Filter by search text
+        if !searchText.isEmpty {
+            filtered = filtered.filter { book in
+                book.title.localizedCaseInsensitiveContains(searchText) ||
+                book.author.localizedCaseInsensitiveContains(searchText) ||
+                book.narrator?.localizedCaseInsensitiveContains(searchText) == true
+            }
+        }
+
+        // Sort
+        switch sortOrder {
+        case .title:
+            filtered.sort { $0.title.localizedCompare($1.title) == .orderedAscending }
+        case .author:
+            filtered.sort { $0.author.localizedCompare($1.author) == .orderedAscending }
+        case .dateAdded:
+            filtered.sort { $0.dateAdded > $1.dateAdded }
+        case .lastPlayed:
+            filtered.sort { ($0.lastPlayedDate ?? Date.distantPast) > ($1.lastPlayedDate ?? Date.distantPast) }
+        case .progress:
+            filtered.sort { $0.progress < $1.progress }
+        case .duration:
+            filtered.sort { $0.duration < $1.duration }
+        }
+
+        return filtered
     }
 
     var body: some View {
@@ -60,8 +159,24 @@ struct LibraryView: View {
                 if filteredAudiobooks.isEmpty {
                     EmptyLibraryView()
                 } else {
-                    // TODO: Implement library content
-                    Text("Library content will be implemented")
+                    ScrollView {
+                        LazyVGrid(
+                            columns: Array(repeating: GridItem(.flexible()), count: viewLayout == .grid ? 2 : 1),
+                            spacing: UIConstants.standardPadding
+                        ) {
+                            ForEach(filteredAudiobooks) { audiobook in
+                                AudiobookCard(
+                                    audiobook: audiobook,
+                                    playbackManager: playbackManager,
+                                    onTap: {
+                                        selectedAudiobook = audiobook
+                                        showingPlayer = true
+                                    }
+                                )
+                            }
+                        }
+                        .padding(.horizontal, UIConstants.standardPadding)
+                    }
                 }
             }
             .navigationTitle("My Library")
@@ -85,6 +200,11 @@ struct LibraryView: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
+                }
+            }
+            .sheet(isPresented: $showingPlayer) {
+                if let audiobook = selectedAudiobook {
+                    PlayerView(audiobook: audiobook, playbackManager: playbackManager)
                 }
             }
         }
