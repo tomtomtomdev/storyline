@@ -255,12 +255,149 @@ actor PlaybackManager {
                 options: [
                     .allowBluetooth,
                     .allowAirPlay,
-                    .allowBluetoothA2DP
+                    .allowBluetoothA2DP,
+                    .interruptSpokenAudioAndMixWithOthers
                 ]
             )
             try audioSession.setActive(true)
+
+            // Register for audio interruption notifications
+            await registerForAudioInterruptions()
         } catch {
             print("Failed to configure audio session: \(error)")
+        }
+    }
+
+    /// Registers for audio interruption notifications
+    private func registerForAudioInterruptions() async {
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] notification in
+            Task {
+                await self?.handleAudioInterruption(notification)
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] notification in
+            Task {
+                await self?.handleRouteChange(notification)
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereLostNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] notification in
+            Task {
+                await self?.handleMediaServicesLost(notification)
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] notification in
+            Task {
+                await self?.handleMediaServicesReset(notification)
+            }
+        }
+    }
+
+    /// Handles audio interruptions
+    private func handleAudioInterruption(_ notification: Notification) async {
+        guard let userInfo = notification.userInfo,
+              let interruptionTypeRaw = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let interruptionType = AVAudioSession.InterruptionType(rawValue: interruptionTypeRaw) else {
+            return
+        }
+
+        let wasPlaying = playbackState == .playing
+
+        switch interruptionType {
+        case .began:
+            // Audio interruption began - pause playback
+            await pause()
+            print("Audio interruption began - playback paused")
+
+        case .ended:
+            // Audio interruption ended
+            if let interruptionOptionRaw = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+                let interruptionOption = AVAudioSession.InterruptionOptions(rawValue: interruptionOptionRaw)
+                if interruptionOption.contains(.shouldResume) && wasPlaying {
+                    // Resume playback if option allows and was playing before interruption
+                    await play()
+                    print("Audio interruption ended - playback resumed")
+                } else {
+                    print("Audio interruption ended - playback not resumed")
+                }
+            }
+
+        @unknown default:
+            break
+        }
+    }
+
+    /// Handles route changes (e.g., headphones unplugged)
+    private func handleRouteChange(_ notification: Notification) async {
+        guard let userInfo = notification.userInfo,
+              let routeChangeReasonRaw = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let routeChangeReason = AVAudioSession.RouteChangeReason(rawValue: routeChangeReasonRaw) else {
+            return
+        }
+
+        switch routeChangeReason {
+        case .oldDeviceUnavailable:
+            // Headphones unplugged - pause playback
+            await pause()
+            print("Route changed: Device unavailable - playback paused")
+
+        case .newDeviceAvailable:
+            // Headphones plugged in
+            print("Route changed: New device available")
+
+        case .categoryChange:
+            print("Route changed: Category changed")
+
+        case .override:
+            print("Route changed: Override")
+
+        case .wakeFromSleep:
+            print("Route changed: Wake from sleep")
+
+        case .noSuitableRouteForCategory:
+            print("Route changed: No suitable route")
+
+        case .routeConfigurationChange:
+            print("Route changed: Configuration change")
+
+        @unknown default:
+            print("Route changed: Unknown reason")
+        }
+    }
+
+    /// Handles media services loss
+    private func handleMediaServicesLost(_ notification: Notification) async {
+        print("Media services were lost")
+        await stop()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+
+    /// Handles media services reset
+    private func handleMediaServicesReset(_ notification: Notification) async {
+        print("Media services were reset")
+        // Reconfigure audio session
+        await configureAudioSession()
+        // Update now playing info if needed
+        if currentAudiobook != nil {
+            await updateNowPlayingInfo()
         }
     }
 
@@ -356,7 +493,10 @@ actor PlaybackManager {
 
     /// Updates the now playing info in the control center and lock screen
     private func updateNowPlayingInfo() async {
-        guard let audiobook = currentAudiobook else { return }
+        guard let audiobook = currentAudiobook else {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            return
+        }
 
         var nowPlayingInfo = [String: Any]()
         nowPlayingInfo[MPMediaItemPropertyTitle] = audiobook.title
@@ -365,6 +505,10 @@ actor PlaybackManager {
         nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
         nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = playbackState == .playing ? playbackRate : 0.0
+        nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = PlaybackConstants.defaultPlaybackSpeed
+
+        // Add progress information
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackProgress] = audiobook.progress
 
         // Add artwork if available
         if let artworkData = audiobook.artworkData,
@@ -375,6 +519,25 @@ actor PlaybackManager {
         }
 
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+
+        // Update playback state in control center
+        await updatePlaybackStateInControlCenter()
+    }
+
+    /// Updates the playback state in the Control Center
+    private func updatePlaybackStateInControlCenter() async {
+        let playbackInfoCenter = MPNowPlayingInfoCenter.default()
+
+        switch playbackState {
+        case .playing:
+            playbackInfoCenter.playbackState = .playing
+        case .paused:
+            playbackInfoCenter.playbackState = .paused
+        case .stopped:
+            playbackInfoCenter.playbackState = .stopped
+        case .buffering:
+            playbackInfoCenter.playbackState = .interrupted
+        }
     }
 
     // MARK: - Remote Command Center
@@ -410,6 +573,15 @@ actor PlaybackManager {
             return .success
         }
 
+        // Toggle Play/Pause command
+        commandCenter.togglePlayPauseCommand.isEnabled = true
+        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task {
+                await self?.togglePlayPause()
+            }
+            return .success
+        }
+
         // Skip forward command
         commandCenter.skipForwardCommand.isEnabled = true
         commandCenter.skipForwardCommand.preferredIntervals = [NSNumber(value: PlaybackConstants.defaultSkipInterval)]
@@ -430,6 +602,18 @@ actor PlaybackManager {
             return .success
         }
 
+        // Next track (for switching audiobooks)
+        commandCenter.nextTrackCommand.isEnabled = false
+        commandCenter.nextTrackCommand.addTarget { _ in
+            return .commandFailed
+        }
+
+        // Previous track (for switching audiobooks)
+        commandCenter.previousTrackCommand.isEnabled = false
+        commandCenter.previousTrackCommand.addTarget { _ in
+            return .commandFailed
+        }
+
         // Change playback position command
         commandCenter.changePlaybackPositionCommand.isEnabled = true
         commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
@@ -442,6 +626,25 @@ actor PlaybackManager {
             }
             return .success
         }
+
+        // Change playback rate command
+        commandCenter.changePlaybackRateCommand.isEnabled = true
+        commandCenter.changePlaybackRateCommand.supportedPlaybackRates = PlaybackConstants.playbackSpeeds.map { NSNumber(value: $0) }
+        commandCenter.changePlaybackRateCommand.addTarget { [weak self] event in
+            guard let event = event as? MPChangePlaybackRateCommandEvent else {
+                return .commandFailed
+            }
+
+            Task {
+                await self?.setPlaybackSpeed(event.playbackRate)
+            }
+            return .success
+        }
+
+        // Enable feedback for headphones
+        commandCenter.playCommand.isEnabled = true
+        commandCenter.pauseCommand.isEnabled = true
+        commandCenter.stopCommand.isEnabled = true
     }
 }
 
